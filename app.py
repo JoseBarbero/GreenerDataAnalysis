@@ -12,10 +12,42 @@ from grupos_columnas import columnas_grupos
 
 st.set_page_config(page_title="Greener / BioRem — Analysis", layout="wide")
 st.title("Soil microbiome analysis — Greener / BioRem")
-st.caption(
-    "Dataset: `datos_combinados.csv` — 54 samples × 664+ variables. "
-    "6 treatments (BA, BS, CT, VCBA, VCBS, VCT) × 4 time points (days 2, 15, 60, 91) × 3 replicates. "
-    "⚠️ `VCBS_15` and `VCBA_15` have no 16S data — they appear as gaps in bar plots and heatmaps."
+
+st.markdown("""
+This interactive tool accompanies the **Greener / BioRem bioremediation study**, which investigates
+how different soil treatments reshape the microbial community over time in hydrocarbon-contaminated soil.
+
+**Experimental design**
+
+| Factor | Levels |
+|--------|--------|
+| Treatment | BA, BS, CT, VCBA, VCBS, VCT |
+| Time point | Day 2, 15, 60, 91 |
+| Replicates | 3 per treatment × time point |
+| **Total** | **54 samples** |
+
+The dataset (`datos_combinados.csv`) contains **664+ variables** per sample: physicochemical parameters
+(pH, electrical conductivity, organic matter, nutrients, contaminants), soil texture,
+and 16S rRNA amplicon sequencing data quantified at the **family** and **genus** level.
+Functional trait predictions from **PAPRICA** are also available and can be used in the heatmap.
+
+**Suggested workflow**
+
+1. **Bar plots** — get a first impression of which taxa dominate and how community composition
+   shifts across treatments and time.
+2. **Heatmap** — inspect the full abundance matrix and see how samples cluster based on
+   composition (or PAPRICA functional profile).
+3. **PCoA** — test statistically whether groups differ in composition (PERMANOVA) and that
+   the differences are not artefacts of unequal within-group variability (PERMDISP).
+4. **Forward selection** — identify which physicochemical variables drive the community
+   differences, avoiding over-fitting.
+5. **RDA** — visualise the constrained ordination: how samples separate *along the gradients*
+   defined by the selected physicochemical variables.
+""")
+
+st.warning(
+    "⚠️ `VCBS_15` and `VCBA_15` have no 16S data — they are excluded from all microbiome analyses "
+    "and appear as gaps in bar plots and heatmaps."
 )
 
 # ── Data ──────────────────────────────────────────────────────────────────────
@@ -76,11 +108,28 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 # ─────────────────────────────────────────────────────────────────────────────
 with tab1:
     st.subheader("Relative abundance bar plots")
-    st.write(
-        "Each bar shows the fraction of the microbial community for each taxon in a given "
-        "treatment × day combination (replicate means). Taxa below the threshold in every "
-        "sample are grouped into **Other** (grey)."
-    )
+    st.markdown("""
+Stacked bar charts showing the **relative abundance** of each taxon across all treatment × day
+combinations. Values are averaged over the 3 replicates and normalised so that each bar sums to 1
+(100% relative abundance).
+
+**How to read the chart**
+
+- Each colour represents one taxon (family or genus). Colour assignment is stable within a session.
+- The grey segment labelled *Other* pools all taxa whose maximum relative abundance across
+  all samples is below the chosen threshold — this keeps the legend readable without discarding
+  any actual data from the statistics.
+- Bars are ordered by treatment group to make temporal trends (left → right within each treatment)
+  and cross-treatment comparisons easy to spot.
+
+**Parameters**
+
+| Parameter | Effect |
+|-----------|--------|
+| **Level** | Switch between family-level and genus-level taxonomy. |
+| **Threshold** | Minimum relative abundance a taxon must reach in at least one sample to get its own colour. Lower = more taxa shown, busier legend. |
+""")
+    st.divider()
     ctrl, plot_area = st.columns([1, 4])
     with ctrl:
         bp_level = st.selectbox("Level", ["Family", "Genus"], key="bp_level")
@@ -116,11 +165,33 @@ with tab1:
 # ─────────────────────────────────────────────────────────────────────────────
 with tab2:
     st.subheader("Heatmap + dendrograms (taxa × samples)")
-    st.write(
-        "Compact view of the full abundance matrix. "
-        "Colour = relative abundance normalised per sample (red = above mean, blue = below). "
-        "The **top dendrogram** can use 16S composition or the PAPRICA functional profile."
-    )
+    st.markdown("""
+A **clustered heatmap** that simultaneously shows the full abundance matrix and the hierarchical
+relationships among samples (columns) and taxa (rows).
+
+**Colour scale** — red/blue diverging palette centred on the mean relative abundance across the
+matrix. Red cells indicate a taxon is more abundant than average in that sample; blue cells indicate
+it is less abundant. This makes it easy to spot which taxa are characteristic of which treatments.
+
+**Dendrograms** — both the row (taxa) and column (samples) trees are built by hierarchical
+clustering using **Bray–Curtis dissimilarity** and average linkage. Samples that cluster together
+have similar community composition.
+
+**PAPRICA functional profile (optional top tree)** — instead of clustering samples by their
+16S composition, you can use the functional trait predictions from PAPRICA
+(Phylogenetic Assignment of Microbial Pathway Reconstruction and Interpretation with Assembly).
+This answers a different but complementary question: do samples that look functionally similar
+also look taxonomically similar?
+
+**Parameters**
+
+| Parameter | Effect |
+|-----------|--------|
+| **Level** | Family-level (fewer rows, easier to read) or genus-level (more detail). |
+| **Threshold** | Exclude taxa that never exceed this relative abundance — reduces clutter in the row dendrogram. |
+| **Top tree: PAPRICA** | If checked, the column dendrogram uses PAPRICA functional distances; otherwise it uses 16S Bray–Curtis. |
+""")
+    st.divider()
     ctrl2, plot_area2 = st.columns([1, 4])
     with ctrl2:
         hm_level   = st.selectbox("Level", ["Family", "Genus"], key="hm_level")
@@ -170,13 +241,46 @@ with tab2:
 # ─────────────────────────────────────────────────────────────────────────────
 with tab3:
     st.subheader("PCoA + PERMANOVA + PERMDISP")
-    st.write(
-        "Projects Bray–Curtis distances between samples onto 2D. "
-        "**PERMANOVA** tests whether groups differ in composition more than expected by chance "
-        "(R² = fraction of total variation explained). "
-        "**PERMDISP** checks that differences reflect composition, not just within-group spread. "
-        "Results are cached — only recomputed when level, grouping, or metric changes."
-    )
+    st.markdown("""
+**Principal Coordinates Analysis (PCoA)** is an unconstrained ordination method. It takes the
+pairwise dissimilarity matrix between all 48 samples (with 16S data) and projects them onto a
+2-dimensional plane so that samples that are most similar end up closest to each other.
+The percentage on each axis label tells you how much of the total between-sample variation is
+captured by that axis.
+
+Unlike PCA, PCoA can work with any dissimilarity metric. **Bray–Curtis** (the default) is the
+standard choice for microbial ecology: it is bounded between 0 (identical communities) and 1
+(no shared taxa), and it ignores double-zeros (two samples sharing no taxa are not considered
+"similar" just because both lack a taxon).
+
+---
+
+**PERMANOVA** (Permutational Multivariate Analysis of Variance) tests statistically whether
+the group centroids differ more than expected by random chance. It permutes sample labels 999
+times to build a null distribution and computes an empirical p-value.
+
+- **R²** = proportion of total community variation explained by the grouping variable.
+  An R² of 0.30 means 30% of variation is attributable to treatment/day differences.
+- A significant p-value (< 0.05) means the groups are compositionally distinct.
+
+**PERMDISP** (Permutational Multivariate Dispersion) checks a key assumption of PERMANOVA:
+that within-group variability is homogeneous across groups. If PERMDISP is also significant
+(p < 0.05), the PERMANOVA result may partly reflect differences in *spread* rather than
+differences in *location*, and should be interpreted with caution (the plot flags this in red).
+
+---
+
+**Parameters**
+
+| Parameter | Effect |
+|-----------|--------|
+| **Level** | Taxonomy level used to compute dissimilarities. |
+| **Group by** | Defines the groups for PERMANOVA/PERMDISP and the colour coding of points. |
+| **Metric** | Dissimilarity index. Bray–Curtis is recommended for relative abundance data. Jaccard is presence/absence only. Euclidean is not recommended for compositional data. |
+| **Ellipses** | 95% confidence ellipses (normal distribution approximation) for each group. Useful when groups overlap. |
+| **Sample labels** | Places one label per Treatment+Day combination at the centroid of its 3 replicates. |
+""")
+    st.divider()
     ctrl3, plot_area3 = st.columns([1, 3])
     with ctrl3:
         pc_level   = st.selectbox("Level", ["Family", "Genus"], key="pc_level")
@@ -267,13 +371,42 @@ with tab3:
 # ─────────────────────────────────────────────────────────────────────────────
 with tab4:
     st.subheader("Forward selection of physicochemical variables")
-    st.info(
-        "Identifies the physicochemical variables that explain microbial composition "
-        "**significantly and independently** (equivalent to `ordiR2step` in R/vegan). "
-        "Run this before the RDA. Results are stored in the session and pre-loaded in the RDA tab."
-    )
+    st.markdown("""
+Before building the RDA model, we need to decide which physicochemical variables to include.
+Including all ~14 candidates would over-fit the model (the axes would partially reflect noise,
+not real community–environment relationships). **Forward selection** solves this by adding
+variables one at a time, keeping only those that pass two simultaneous stopping criteria:
+
+1. **Statistical significance** — the variable must contribute significantly to the explained
+   variation (permutation test, p ≤ α).
+2. **Adjusted R² ceiling** — the adjusted R² of the growing model must not exceed the adjusted
+   R² of the global model that includes all variables. This is the double stopping criterion
+   from [Blanchet, Legendre & Borcard (2008)](https://doi.org/10.1890/07-0986.1),
+   equivalent to R's `vegan::ordiR2step`.
+
+At each step, all remaining candidate variables are tested; the one that maximises the adjusted
+R² while meeting both criteria is added. The algorithm stops when no remaining variable
+satisfies both criteria simultaneously.
+
+**How to use this tab**
+
+Run forward selection at least once before using the RDA tab. The selected variables will be
+automatically pre-loaded as the default variable set in the RDA. You can always override them
+manually in the RDA tab.
+
+**Parameters**
+
+| Parameter | Effect |
+|-----------|--------|
+| **Level** | Should match the level you plan to use in the RDA. |
+| **Taxon threshold** | Removes very rare taxa before computing the Hellinger-transformed abundance matrix Y. |
+| **Significance α** | Permutation p-value threshold for retaining a variable. Default 0.05. |
+| **Permutations** | More permutations → more precise p-values, but slower. 199 is a good starting point; use 999 for the final run in the paper. |
+""")
+    st.info("**Tip:** Run this tab first, then switch to the RDA tab — results are passed automatically.")
     st.warning(
-        "⏱️ This can take **several minutes** (each step evaluates ~14 candidates × n full RDA permutations)."
+        "⏱️ This can take **several minutes** (each step evaluates all remaining candidates "
+        "with a full permutation test). Do not close the browser tab while it runs."
     )
 
     col_a, col_b = st.columns(2)
@@ -346,12 +479,43 @@ with tab4:
 # ─────────────────────────────────────────────────────────────────────────────
 with tab5:
     st.subheader("RDA biplot")
-    st.write(
-        "Ordination constrained to the variation explained by the selected physicochemical variables. "
-        "**Arrows** = physicochemical variables (direction = where variable increases, length = association strength). "
-        "**Axis %** = fraction of community variation explained by the physicochemical variables. "
-        "The RDA computation is cached — only recomputed when inputs change."
-    )
+    st.markdown("""
+**Redundancy Analysis (RDA)** is a *constrained* ordination: unlike PCoA, which places samples
+freely in ordination space, RDA only allows the axes to be linear combinations of the
+physicochemical predictor variables. The result is a biplot that simultaneously shows:
+
+- **Sample scores** (points) — where each sample sits in the space defined by the predictors.
+  Samples that are close together have similar microbial communities *and* similar physicochemical
+  conditions.
+- **Arrows** — the selected physicochemical variables. The direction of each arrow shows where
+  that variable increases; the length is proportional to how strongly it drives community
+  variation. Arrows pointing in the same direction indicate correlated variables. Arrows pointing
+  to a cluster of samples indicate that those samples have higher values of that variable.
+- **Axis labels (%)** — the percentage of *total constrained variation* captured by each axis.
+  Note: this is not the same as in PCoA — RDA axes explain variation in Y *that is attributable
+  to X*, not total community variation.
+
+**Hellinger transformation** — species abundance data are Hellinger-transformed (√ relative
+abundance) before the RDA. This down-weights dominant taxa and makes the ordination less sensitive
+to rare taxa with extreme values, which is the recommended pre-treatment for RDA on ecological
+community data (Legendre & Gallagher, 2001).
+
+**Global permutation test** — the R² reported below the plot is the total constrained R²
+(fraction of community variation explained by all selected variables together). The p-value
+comes from a permutation test (sample labels shuffled, RDA re-computed).
+
+**Parameters**
+
+| Parameter | Effect |
+|-----------|--------|
+| **Level** | Taxonomy level for the community matrix Y. |
+| **Physicochemical variables** | Variables to use as predictors X. Pre-populated from the forward selection result; you can add or remove manually. |
+| **Taxon threshold** | Exclude very rare taxa from Y (same logic as bar plots). |
+| **Permutations** | Number of permutations for the global test. |
+| **Ellipses** | 95% confidence ellipses per treatment group. |
+| **Labels** | Show Treatment+Day label for each individual sample point. |
+""")
+    st.divider()
 
     default_vars = st.session_state.get(
         "vars_fs", ["pH", "EC (dS/m)", "%OM", "N-NO3 (mg/kg)", "P-PO4 (mg/kg)"]
