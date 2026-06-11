@@ -616,11 +616,14 @@ comes from a permutation test (sample labels shuffled, RDA re-computed).
             if rda_ell:
                 _ellipse(ax_r, pts, c)
         if rda_labels:
-            texts_r = [
-                ax_r.text(sc_r[i, 0], sc_r[i, 1], lbl_r[i],
-                           fontsize=7.5, color=cmap_r[g_r[i]], fontweight="bold")
-                for i in range(len(sc_r))
-            ]
+            # One label per Treatment_Day combination, placed at the centroid of its 3 replicates
+            texts_r = []
+            for lbl in sorted(set(lbl_r)):
+                mask = lbl_r == lbl
+                cx, cy = sc_r[mask].mean(axis=0)
+                grp = g_r[mask][0]
+                texts_r.append(ax_r.text(cx, cy, lbl, fontsize=7.5, color=cmap_r[grp],
+                                          fontweight="bold", ha="center", va="center"))
             fig_r.canvas.draw()
             with contextlib.redirect_stdout(io.StringIO()):
                 adjust_text(texts_r, ax=ax_r, arrowprops=dict(arrowstyle="-", color="#aaa", lw=0.6))
