@@ -384,9 +384,15 @@ variables one at a time, keeping only those that pass two simultaneous stopping 
    from [Blanchet, Legendre & Borcard (2008)](https://doi.org/10.1890/07-0986.1),
    equivalent to R's `vegan::ordiR2step`.
 
-At each step, all remaining candidate variables are tested; the one that maximises the adjusted
-R² while meeting both criteria is added. The algorithm stops when no remaining variable
-satisfies both criteria simultaneously.
+At each step the candidate that most increases the adjusted R² is identified, and its **marginal**
+contribution — conditioned on the variables already selected — is assessed with a partial-RDA
+permutation test (the same pseudo-F + reduced-model scheme as vegan's `anova.cca`). It is added only
+if that marginal test is significant *and* the adjusted R² stays below the ceiling. The algorithm
+stops as soon as the best candidate fails either criterion.
+
+Y (Hellinger-transformed) is only **centred** before the RDA — matching vegan's `rda()`, not
+standardised — so the procedure reproduces `ordiR2step` (verified against vegan on this dataset:
+same variables, same order, same per-step adjusted R²).
 
 **How to use this tab**
 
@@ -401,13 +407,10 @@ manually in the RDA tab.
 | **Level** | Should match the level you plan to use in the RDA. |
 | **Taxon threshold** | Removes very rare taxa before computing the Hellinger-transformed abundance matrix Y. |
 | **Significance α** | Permutation p-value threshold for retaining a variable. Default 0.05. |
-| **Permutations** | More permutations → more precise p-values, but slower. 199 is a good starting point; use 999 for the final run in the paper. |
+| **Permutations** | More permutations → more precise p-values. 999 is recommended (it runs in ~1 s). |
 """)
     st.info("**Tip:** Run this tab first, then switch to the RDA tab — results are passed automatically.")
-    st.warning(
-        "⏱️ This can take **several minutes** (each step evaluates all remaining candidates "
-        "with a full permutation test). Do not close the browser tab while it runs."
-    )
+    st.caption("⏱️ Fast (~1 s): the permutation test runs only on the best candidate at each step.")
 
     col_a, col_b = st.columns(2)
     with col_a:
@@ -418,55 +421,84 @@ manually in the RDA tab.
         fs_alpha  = st.slider("Significance α", 0.01, 0.10, 0.05, 0.01,
                                format="%.2f", key="fs_alpha")
         fs_nperm  = st.select_slider("Permutations",
-                                      options=[99, 199, 299, 499, 999], value=199, key="fs_nperm")
+                                      options=[99, 199, 299, 499, 999], value=999, key="fs_nperm")
 
     if st.button("▶ Run forward selection", type="primary"):
+        # Faithful replica of vegan::ordiR2step.
+        # RDA = multivariate regression of Y (Hellinger, only centred — like vegan's
+        # rda(), not standardised) on X (standardised physicochemicals). Each step adds
+        # the variable that most increases the adjusted R², provided (a) its MARGINAL
+        # contribution is significant (partial RDA conditioned on the already-selected
+        # variables, same pseudo-F + reduced-model permutation as anova.cca) and (b) the
+        # adjusted R² stays below the full-model ceiling (R2scope).
         cols  = levels[fs_level]
         d     = df.dropna(subset=cols).copy()
         rel   = d[cols].div(d[cols].sum(axis=1), axis=0)
-        Y     = np.sqrt(rel[rel.columns[rel.max(axis=0) >= fs_thr]])
-        X_all = d[fq_cols].apply(pd.to_numeric, errors="coerce")
-        X_all = ((X_all - X_all.mean()) / X_all.std()).dropna(axis=1)
+        Y     = np.sqrt(rel[rel.columns[rel.max(axis=0) >= fs_thr]]).values   # Hellinger
+        X     = d[fq_cols].apply(pd.to_numeric, errors="coerce")
+        X     = ((X - X.mean()) / X.std()).dropna(axis=1)                     # standardised
+        Xcols = list(X.columns)
+        X     = X.values
         n     = len(Y)
+        Yc    = Y - Y.mean(0)            # vegan rda() centres Y (does not scale it)
+        ss_tot = (Yc ** 2).sum()
+        rng   = np.random.default_rng(42)
 
-        def _r2(Y_, X_sub):
-            p = X_sub.shape[1]
-            return rda(Y_, X_sub, scale_Y=True, scaling=2).proportion_explained.iloc[:p].sum()
+        def _r2(idx):
+            Z = np.column_stack([np.ones(n), X[:, idx]])
+            beta = np.linalg.lstsq(Z, Yc, rcond=None)[0]
+            return ((Z @ beta) ** 2).sum() / ss_tot
 
         def _r2adj(r2, p):
             return 1 - (1 - r2) * (n - 1) / (n - p - 1)
 
-        r2adj_scope = _r2adj(_r2(Y, X_all), X_all.shape[1])
+        def _marginal_p(sel_idx, var_idx):
+            Zc = np.column_stack([np.ones(n)] + ([X[:, sel_idx]] if sel_idx else []))
+            Pc = Zc @ np.linalg.pinv(Zc)
+            Yr = Yc - Pc @ Yc
+            vr = X[:, var_idx] - Pc @ X[:, var_idx]
+            df_res = n - np.linalg.matrix_rank(Zc) - 1
+
+            def _F(Ym):
+                nu = ((Ym.T @ vr) ** 2).sum() / (vr @ vr) if vr @ vr > 1e-12 else 0.0
+                return nu / (((Ym ** 2).sum() - nu) / df_res)
+
+            f_obs, cnt = _F(Yr), 1
+            for _ in range(fs_nperm):
+                Yp = Yr[rng.permutation(n)]
+                Yp = Yp - Pc @ Yp
+                cnt += _F(Yp) >= f_obs - 1e-12
+            return cnt / (fs_nperm + 1)
+
+        p_full      = np.linalg.matrix_rank(np.column_stack([np.ones(n), X])) - 1
+        r2adj_scope = _r2adj(_r2(list(range(X.shape[1]))), p_full)
         log_area = st.empty()
         lines = [f"R²adj full model (scope): **{r2adj_scope:.4f}**"]
         log_area.markdown("\n\n".join(lines))
 
-        selected, remaining = [], list(X_all.columns)
-        np.random.seed(42)
+        selected, remaining = [], list(range(X.shape[1]))
         with st.spinner("Running…"):
             while remaining:
-                best = None
-                for var in remaining:
-                    X_test    = X_all[selected + [var]]
-                    r2_obs    = _r2(Y, X_test)
-                    r2adj_obs = _r2adj(r2_obs, X_test.shape[1])
-                    if r2adj_obs > r2adj_scope:
-                        continue
-                    r2_null = [_r2(Y.sample(frac=1).set_axis(Y.index), X_test)
-                               for _ in range(fs_nperm)]
-                    p_val = (np.sum(np.array(r2_null) >= r2_obs) + 1) / (fs_nperm + 1)
-                    if p_val <= fs_alpha and (best is None or r2adj_obs > best[2]):
-                        best = (var, p_val, r2adj_obs)
-                if best is None:
+                r2adj_new, var = max((_r2adj(_r2(selected + [v]), len(selected) + 1), v)
+                                     for v in remaining)
+                if r2adj_new > r2adj_scope:                    # stop (a): R2scope
+                    lines.append(f"Stop: **{Xcols[var]}** would exceed the ceiling "
+                                 f"(R²adj={r2adj_new:.4f}).")
                     break
-                var, p_val, r2adj_obs = best
+                p_val = _marginal_p(selected, var)
+                if p_val > fs_alpha:                           # stop (b): not significant
+                    lines.append(f"Stop: **{Xcols[var]}** not significant (p={p_val:.3f}).")
+                    break
                 selected.append(var)
                 remaining.remove(var)
-                lines.append(f"Step {len(selected)}: **+{var}** → R²adj={r2adj_obs:.4f}, p={p_val:.3f}")
+                lines.append(f"Step {len(selected)}: **+{Xcols[var]}** → "
+                             f"R²adj={r2adj_new:.4f}, p={p_val:.3f}")
                 log_area.markdown("\n\n".join(lines))
 
-        st.session_state["vars_fs"] = selected
-        st.success(f"**Selected ({len(selected)}):** {selected}  \nSwitch to the **RDA** tab to visualise.")
+        sel_names = [Xcols[i] for i in selected]
+        log_area.markdown("\n\n".join(lines))
+        st.session_state["vars_fs"] = sel_names
+        st.success(f"**Selected ({len(sel_names)}):** {sel_names}  \nSwitch to the **RDA** tab to visualise.")
 
     elif "vars_fs" in st.session_state:
         st.success(
@@ -529,7 +561,7 @@ comes from a permutation test (sample labels shuffled, RDA re-computed).
         rda_thr    = st.slider("Taxon threshold", 0.01, 0.10, 0.02, 0.01,
                                 format="%.2f", key="rda_thr")
         rda_nperm  = st.select_slider("Permutations",
-                                       options=[99, 199, 299, 499, 999], value=199, key="rda_nperm")
+                                       options=[99, 199, 299, 499, 999], value=999, key="rda_nperm")
         rda_ell    = st.checkbox("Ellipses", value=True, key="rda_ell")
         rda_labels = st.checkbox("Labels", value=False, key="rda_labels")
 
@@ -549,7 +581,9 @@ comes from a permutation test (sample labels shuffled, RDA re-computed).
             X    = d[list(variables)].apply(pd.to_numeric, errors="coerce")
             X    = (X - X.mean()) / X.std()
             X.index = d["sample"]
-            res    = rda(Y, X, scale_Y=True, scaling=2)
+            # scale_Y=False -> Y only centred, like vegan's rda() (Y is already Hellinger).
+            # Consistent with the forward-selection tab.
+            res    = rda(Y, X, scale_Y=False, scaling=2)
             pe     = res.proportion_explained.values[:2]
             sc     = res.samples.iloc[:, :2].values
             bp     = res.biplot_scores.iloc[:, :2].values
@@ -557,7 +591,7 @@ comes from a permutation test (sample labels shuffled, RDA re-computed).
             R2_obs = float(res.proportion_explained.iloc[:p].sum())
             np.random.seed(42)
             R2_null = [
-                rda(Y.sample(frac=1).set_axis(Y.index), X, scale_Y=True, scaling=2)
+                rda(Y.sample(frac=1).set_axis(Y.index), X, scale_Y=False, scaling=2)
                 .proportion_explained.iloc[:p].sum()
                 for _ in range(n_perm)
             ]
