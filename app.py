@@ -97,6 +97,39 @@ def _ellipse(ax, pts, color):
         angle=ang, color=color, alpha=0.10, linewidth=0.8, linestyle="--", fill=True,
     ))
 
+
+def _place_labels(ax, coords, labels, groups, cmap, avoid=None):
+    """One label per unique value in `labels`, placed at the centroid of its points and
+    then repelled from every data point (and from the other labels) so it stays readable.
+    A white halo keeps it legible if it still lands near a point. Shared by PCoA and RDA
+    for consistent, non-overlapping labelling.
+
+    `coords` (n,2): point coordinates. `labels` (n,): label per point (one text per unique).
+    `groups` (n,): grouping used for colour. `avoid`: optional (m,2) extra coordinates to
+    keep clear (e.g. RDA arrow tips).
+    """
+    coords = np.asarray(coords)
+    labels = np.asarray(labels)
+    groups = np.asarray(groups)
+    texts = []
+    for lb in sorted(set(labels)):
+        m = labels == lb
+        cx, cy = coords[m].mean(axis=0)
+        texts.append(ax.text(cx, cy, lb, fontsize=7.5, color=cmap[groups[m][0]],
+                             fontweight="bold", ha="center", va="center", zorder=6,
+                             bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.7)))
+    ax_x, ax_y = coords[:, 0], coords[:, 1]
+    if avoid is not None:
+        a = np.asarray(avoid)
+        ax_x = np.concatenate([ax_x, a[:, 0]])
+        ax_y = np.concatenate([ax_y, a[:, 1]])
+    with contextlib.redirect_stdout(io.StringIO()):
+        adjust_text(texts, x=ax_x, y=ax_y, ax=ax,
+                    force_text=(0.4, 0.6), force_static=(0.3, 0.5),
+                    expand=(1.3, 1.6), min_arrow_len=8,
+                    arrowprops=dict(arrowstyle="-", color="#888", lw=0.6))
+    return texts
+
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -336,16 +369,9 @@ differences in *location*, and should be interpreted with caution (the plot flag
         if pc_ell:
             _ellipse(ax_pc, pts, c)
     if pc_labels:
-        texts = []
-        for lbl in sorted(set(lbl_pc)):
-            mask = lbl_pc == lbl
-            cx, cy = xy_pc[mask].mean(axis=0)
-            grp = g_pc[mask][0]
-            texts.append(ax_pc.text(cx, cy, lbl, fontsize=7.5, color=cmap_pc[grp],
-                                     fontweight="bold", ha="center", va="center"))
+        # One label per Treatment_Day combination, at its centroid, repelled from points
         fig_pc.canvas.draw()
-        with contextlib.redirect_stdout(io.StringIO()):
-            adjust_text(texts, ax=ax_pc, arrowprops=dict(arrowstyle="-", color="#aaa", lw=0.6))
+        _place_labels(ax_pc, xy_pc, lbl_pc, g_pc, cmap_pc)
     ax_pc.axhline(0, color="gray", lw=0.5, ls="--")
     ax_pc.axvline(0, color="gray", lw=0.5, ls="--")
     ax_pc.set_xlabel(f"PCo1 ({pe_pc[0]*100:.1f}%)")
@@ -615,27 +641,21 @@ comes from a permutation test (sample labels shuffled, RDA re-computed).
                           linewidth=0.6, zorder=3, label=lab)
             if rda_ell:
                 _ellipse(ax_r, pts, c)
-        if rda_labels:
-            # One label per Treatment_Day combination, placed at the centroid of its 3 replicates
-            texts_r = []
-            for lbl in sorted(set(lbl_r)):
-                mask = lbl_r == lbl
-                cx, cy = sc_r[mask].mean(axis=0)
-                grp = g_r[mask][0]
-                texts_r.append(ax_r.text(cx, cy, lbl, fontsize=7.5, color=cmap_r[grp],
-                                          fontweight="bold", ha="center", va="center"))
-            fig_r.canvas.draw()
-            with contextlib.redirect_stdout(io.StringIO()):
-                adjust_text(texts_r, ax=ax_r, arrowprops=dict(arrowstyle="-", color="#aaa", lw=0.6))
+        # Arrows (drawn before labels so their tips can be avoided by the sample labels)
         k_scale = 2.8 * np.abs(sc_r).max() / max(np.abs(bp_r).max(), 1e-9)
+        tips = bp_r[:, :2] * k_scale
         for i, v in enumerate(rda_vars):
-            ax_r.arrow(0, 0, bp_r[i, 0]*k_scale, bp_r[i, 1]*k_scale,
+            ax_r.arrow(0, 0, tips[i, 0], tips[i, 1],
                        color="#333", width=0.002, head_width=0.06,
                        length_includes_head=True, zorder=4)
-            ax_r.text(bp_r[i, 0]*k_scale*1.13, bp_r[i, 1]*k_scale*1.13,
+            ax_r.text(tips[i, 0]*1.13, tips[i, 1]*1.13,
                       v, fontsize=8.5, color="#111", ha="center", fontweight="bold", zorder=5)
-        lx = np.array([bp_r[i, 0]*k_scale*1.18 for i in range(len(rda_vars))])
-        ly = np.array([bp_r[i, 1]*k_scale*1.18 for i in range(len(rda_vars))])
+        if rda_labels:
+            # One label per Treatment_Day combination, at its centroid, repelled from points + arrow tips
+            fig_r.canvas.draw()
+            _place_labels(ax_r, sc_r, lbl_r, g_r, cmap_r, avoid=tips)
+        lx = tips[:, 0] * 1.18
+        ly = tips[:, 1] * 1.18
         all_x = np.concatenate([sc_r[:, 0], lx])
         all_y = np.concatenate([sc_r[:, 1], ly])
         px_ = (all_x.max() - all_x.min()) * 0.12
