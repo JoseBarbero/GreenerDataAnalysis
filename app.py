@@ -1,10 +1,12 @@
 import io, contextlib
 import numpy as np, pandas as pd
 import matplotlib.pyplot as plt, seaborn as sns
+import networkx as nx
 import streamlit as st
 from matplotlib.patches import Ellipse
 from scipy.spatial.distance import pdist, squareform
-from scipy.cluster.hierarchy import linkage
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.stats import spearmanr, kruskal, t as tdist
 from skbio.stats.distance import permanova, permdisp, DistanceMatrix
 from skbio.stats.ordination import pcoa, rda
 from adjustText import adjust_text
@@ -43,6 +45,8 @@ Functional trait predictions from **PAPRICA** are also available and can be used
    differences, avoiding over-fitting.
 5. **RDA** — visualise the constrained ordination: how samples separate *along the gradients*
    defined by the selected physicochemical variables.
+6. **Co-occurrence** — find groups of taxa that move together, and test each group against
+   time and against treatment.
 """)
 
 st.warning(
@@ -55,8 +59,9 @@ st.warning(
 @st.cache_data
 def load_data():
     df = pd.read_csv("datos_combinados.csv")
-    cols_known   = set(sum(columnas_grupos.values(), []))
-    cols_paprica = [c for c in df.columns if c not in cols_known]
+    # grupos_columnas HAS a "Paprica" key, so deriving this by exclusion returned an empty
+    # list and silently disabled the functional dendrogram in the heatmap tab.
+    cols_paprica = columnas_grupos["Paprica"]
     fam_cols = columnas_grupos["Datos brutos por familia"]
     gen_cols = columnas_grupos["Datos brutos por género"]
     fq_cols  = columnas_grupos["Físico-químicos"]
@@ -74,6 +79,18 @@ ORDER = [
     "VCBA_2", "VCBA_15", "VCBA_60", "VCBA_91",
 ]
 
+# PCoA (section 3): a PCoA is built from a distance matrix, so it has no loadings. What can be
+# recovered is how strongly each taxon tracks an axis (correlation with the sample scores). Rare
+# taxa can reach |rho| = 1 by luck on 16 independent points, so only taxa that get somewhere are
+# ranked -- the ordination itself still uses every taxon.
+PCO_MIN_ABUND = 0.02
+
+# Co-occurrence network (section 6): fixed analysis choices, deliberately kept out of the
+# controls. The two overlap almost entirely at n=16 (the FDR is what binds, not the floor),
+# so exposing both was two sliders for one decision.
+NET_ALPHA   = 0.05          # Benjamini-Hochberg FDR across all taxon pairs
+NET_MIN_RHO = 0.6           # effect-size floor on |rho|
+
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
 def _samples(d):
@@ -82,6 +99,12 @@ def _samples(d):
 def _palette(labels):
     labs = sorted(set(labels))
     return {l: c for l, c in zip(labs, plt.cm.tab20(np.linspace(0, 1, len(labs))))}
+
+def _star(p):
+    """Significance marker (***/**/*) used by the co-occurrence network legend and panel."""
+    if not np.isfinite(p):
+        return ""
+    return "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else ""
 
 def _ellipse(ax, pts, color):
     if len(pts) < 3:
@@ -132,8 +155,9 @@ def _place_labels(ax, coords, labels, groups, cmap, avoid=None):
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📊 Bar plots", "🔥 Heatmap", "🗺️ PCoA", "🔍 Forward selection", "➡️ RDA",
+    "🕸️ Co-occurrence",
 ])
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -221,47 +245,94 @@ also look taxonomically similar?
 | Parameter | Effect |
 |-----------|--------|
 | **Level** | Family-level (fewer rows, easier to read) or genus-level (more detail). |
+| **X axis** | `Treatment + Day` keeps the 16 conditions as measured; `Day` collapses to 4 columns; `Treatment` to 6. Collapsing **merges samples**. |
 | **Threshold** | Exclude taxa that never exceed this relative abundance — reduces clutter in the row dendrogram. |
+| **Balanced** | Restrict to the complete 4 treatments × 3 days block, so every column averages the same set. |
 | **Top tree: PAPRICA** | If checked, the column dendrogram uses PAPRICA functional distances; otherwise it uses 16S Bray–Curtis. |
+
+**Collapsing the X axis.** The design is unbalanced, so merged columns are not automatically
+comparable — the labels therefore state what they contain (`Day 15 (2 trt)`, `CT (1 d)`).
+Day 15 holds only BA and BS; day 2 includes the untreated controls (dropping them shifts that
+column by Bray–Curtis 0.143); CT and VCT are single day-2 snapshots. **Balanced** restricts to
+BA/BS/VCBA/VCBS × days 2/60/91, the largest complete block. Averaging is done on **relative
+abundances**, giving each condition equal weight — summing raw reads would let deeply
+sequenced samples dominate (depth varies 2.4× here). Expect **fewer taxa** when collapsing:
+averaging flattens peaks, so at 5 % and family level 26 taxa become 15 by day.
 """)
     st.divider()
     ctrl2, plot_area2 = st.columns([1, 4])
     with ctrl2:
         hm_level   = st.selectbox("Level", ["Family", "Genus"], key="hm_level")
+        hm_xaxis   = st.selectbox("X axis", ["Treatment + Day", "Day", "Treatment"],
+                                  key="hm_xaxis")
         hm_thr     = st.slider("Threshold", 0.02, 0.10, 0.05, 0.005,
                                 format="%.3f", key="hm_thr")
+        hm_balanced = st.checkbox("Balanced (only the complete 4 trt × 3 days block)",
+                                  value=False, key="hm_balanced")
         hm_paprica = st.checkbox("Top tree: PAPRICA", value=True, key="hm_paprica")
 
     @st.cache_data
-    def _heatmap_data(level, threshold, paprica):
-        cols   = levels[level]
-        td_grp = (
-            df.dropna(subset=cols)
-              .assign(td=lambda d: d["Tratamiento"].astype(str) + "_" + d["Dia"].astype(str))
-              .groupby("td")[cols].mean()
-        )
-        rel    = td_grp.div(td_grp.sum(axis=1), axis=0)
-        td_grp = td_grp[rel.columns[rel.max(axis=0) >= threshold]]
-        mat    = td_grp.T.div(td_grp.T.sum(axis=0), axis=1)
-        col_lnk = None
-        if paprica and cols_paprica:
-            pap = (
-                df.assign(td=lambda d: d["Tratamiento"].astype(str) + "_" + d["Dia"].astype(str))
-                  .groupby("td")[cols_paprica].mean()
-                  .reindex(mat.columns).dropna()
-            )
-            mat     = mat[pap.index]
-            col_lnk = linkage(pdist(pap.values, metric="braycurtis"), method="average")
-        return mat, col_lnk, td_grp.shape[1]
+    def _heatmap_data(level, x_axis, threshold, balanced, paprica):
+        cols = levels[level]
+        d    = df.dropna(subset=cols).copy()
+        key  = d["Tratamiento"].astype(str) + "_" + d["Dia"].astype(str)
+        td   = d.groupby(key)[cols].mean()
+        meta = d.groupby(key)[["Tratamiento", "Dia"]].first()
+        pap  = d.groupby(key)[cols_paprica].mean()
 
-    mat_hm, col_lnk_hm, n_taxa_hm = _heatmap_data(hm_level, hm_thr, hm_paprica)
+        if balanced:
+            # Largest complete treatment x day block: treatments seen on >= 3 days AND days
+            # seen in >= 3 treatments. Here that is BA/BS/VCBA/VCBS x days 2/60/91, so every
+            # column averages exactly the same set and the columns become comparable.
+            t_ok = meta["Tratamiento"].map(meta.groupby("Tratamiento").size()) >= 3
+            d_ok = meta["Dia"].map(meta.groupby("Dia").size()) >= 3
+            sel  = (t_ok & d_ok).values
+            td, meta, pap = td[sel], meta[sel], pap[sel]
+
+        # Relative abundance FIRST, then average: summing raw reads would weight each
+        # condition by its sequencing depth (varies 2.4x here) instead of weighting equally.
+        rel = td.div(td.sum(axis=1), axis=0)
+        if x_axis == "Day":
+            grp   = meta["Dia"]
+            names = {k: f"Day {k} ({n} trt)" for k, n in grp.value_counts().items()}
+        elif x_axis == "Treatment":
+            grp   = meta["Tratamiento"]
+            names = {k: f"{k} ({n} d)" for k, n in grp.value_counts().items()}
+        else:
+            grp, names = None, None
+
+        if grp is None:
+            agg, pagg = rel, pap.div(pap.sum(axis=1), axis=0)
+        else:
+            # Column labels carry what they average, so the unbalanced design stays visible
+            agg  = rel.groupby(grp.values).mean().rename(index=names)
+            pagg = (pap.div(pap.sum(axis=1), axis=0)
+                       .groupby(grp.values).mean().rename(index=names))
+
+        # Threshold applied to the aggregated matrix, so taxa are chosen on what is drawn
+        agg = agg[agg.columns[agg.max(axis=0) >= threshold]]
+        mat = agg.T.div(agg.T.sum(axis=0), axis=1)
+
+        col_lnk = None
+        if paprica and len(cols_paprica) and len(mat.columns) > 2:
+            # Same aggregation as the taxa, so the functional tree matches the columns drawn
+            pagg    = pagg.reindex(mat.columns)
+            col_lnk = linkage(pdist(pagg.values, metric="braycurtis"), method="average")
+        return mat, col_lnk, agg.shape[1]
+
+    mat_hm, col_lnk_hm, n_taxa_hm = _heatmap_data(hm_level, hm_xaxis, hm_thr,
+                                                  hm_balanced, hm_paprica)
     with ctrl2:
         st.caption(f"Taxa shown: **{n_taxa_hm}**")
 
+    # Figure scaled to the matrix: collapsing the X axis leaves 3-6 columns, which a fixed
+    # 12-inch width would stretch into absurdly wide cells. The coefficients reproduce the
+    # original (12, 16) for the default view (16 columns, 26 taxa).
     g_hm = sns.clustermap(
         mat_hm, method="average", metric="braycurtis", col_linkage=col_lnk_hm,
         cmap="RdBu_r", center=float(mat_hm.values.mean()),
-        figsize=(12, 16), dendrogram_ratio=(0.12, 0.10),
+        figsize=(2.0 + 0.62 * mat_hm.shape[1], min(24.0, 3.0 + 0.50 * mat_hm.shape[0])),
+        dendrogram_ratio=(0.12, 0.10),
         cbar_pos=(0.02, 0.83, 0.03, 0.13), yticklabels=True,
     )
     g_hm.ax_heatmap.tick_params(axis="y", labelsize=6)
@@ -312,6 +383,18 @@ differences in *location*, and should be interpreted with caution (the plot flag
 | **Metric** | Dissimilarity index. Bray–Curtis is recommended for relative abundance data. Jaccard is presence/absence only. Euclidean is not recommended for compositional data. |
 | **Ellipses** | 95% confidence ellipses (normal distribution approximation) for each group. Useful when groups overlap. |
 | **Sample labels** | Places one label per Treatment+Day combination at the centroid of its 3 replicates. |
+| **Top taxa** | How many families are ranked per axis in the second figure. |
+
+---
+
+**Which taxa drive each axis (second figure).** A PCoA is built from distances, not from the
+taxa, so it has **no loadings**. What the second figure shows is the **Spearman correlation of
+each family with the axis scores** — how strongly it tracks the axis. Green = more abundant
+towards the positive side of the axis, red = towards the negative. Only taxa reaching 2 %
+somewhere are ranked (a rare taxon can hit |ρ| = 1 by luck); the ordination itself still uses
+every taxon. No p-values are given: the three 16S replicate rows are exact copies, so they land
+on the same point and only 16 observations are independent — that leaves ρ unchanged but would
+inflate any p-value.
 """)
     st.divider()
     ctrl3, plot_area3 = st.columns([1, 3])
@@ -323,6 +406,7 @@ differences in *location*, and should be interpreted with caution (the plot flag
                                    ["braycurtis", "jaccard", "euclidean"], key="pc_metric")
         pc_ell     = st.checkbox("Ellipses", value=False, key="pc_ell")
         pc_labels  = st.checkbox("Sample labels", value=True, key="pc_labels")
+        pc_top     = st.slider("Top taxa", 3, 15, 8, 1, key="pc_top")
 
     @st.cache_data(show_spinner="Running PERMANOVA (999 permutations)…")
     def _pcoa_stats(level, group_by, metric):
@@ -348,11 +432,20 @@ differences in *location*, and should be interpreted with caution (the plot flag
         k   = int(pm["number of groups"])
         n   = int(pm["sample size"])
         R2  = F * (k - 1) / (F * (k - 1) + (n - k))
+        # Which taxa track each axis. Spearman (rank-based) because a distance-based ordination
+        # is not expected to be linear in abundance. No p-values: the 16S replicate rows are
+        # exact copies, so the three replicates of a condition land on the same point and only
+        # 16 of the 48 rows are independent -- the correlation is unaffected, its p-value would
+        # not be. The full table is returned so the "Top taxa" control does not re-run PERMANOVA.
+        keep = rel.columns[rel.max(axis=0) >= PCO_MIN_ABUND]
+        corr = pd.DataFrame({f"PCo{k_ + 1}": [spearmanr(rel[t].values, xy[:, k_])[0]
+                                              for t in keep]
+                             for k_ in (0, 1)}, index=keep).fillna(0)
         return (xy, pe, F, R2, float(pm["p-value"]),
                 float(pd_["test statistic"]), float(pd_["p-value"]),
-                g.values.tolist(), d["label"].values.tolist())
+                g.values.tolist(), d["label"].values.tolist(), corr)
 
-    xy_pc, pe_pc, F_pc, R2_pc, pm_p, pdF_pc, pdp_pc, g_pc, lbl_pc = _pcoa_stats(
+    xy_pc, pe_pc, F_pc, R2_pc, pm_p, pdF_pc, pdp_pc, g_pc, lbl_pc, corr_pc = _pcoa_stats(
         pc_level, pc_groupby, pc_metric
     )
     g_pc   = np.array(g_pc)
@@ -391,6 +484,27 @@ differences in *location*, and should be interpreted with caution (the plot flag
     with plot_area3:
         st.pyplot(fig_pc)
     plt.close(fig_pc)
+
+    fig_ld, axes_ld = plt.subplots(1, 2, figsize=(13, 0.34 * pc_top + 2.2), sharex=True)
+    for ax_ld, axis in zip(axes_ld, corr_pc.columns):
+        # Pick the pc_top strongest by |rho|, then order them by signed rho so the positive
+        # and negative ends of the axis read as two blocks instead of interleaving
+        top = corr_pc[axis].reindex(corr_pc[axis].abs().sort_values().index)[-pc_top:].sort_values()
+        ax_ld.barh(range(len(top)), top.values, edgecolor="white", linewidth=0.5,
+                   color=["#2e8b57" if v > 0 else "#c0392b" for v in top.values])
+        ax_ld.set_yticks(range(len(top)))
+        ax_ld.set_yticklabels(top.index, fontsize=7.5)
+        ax_ld.axvline(0, color="gray", lw=0.6)
+        ax_ld.set_xlim(-1, 1)
+        ax_ld.set_xlabel("Spearman ρ with the axis scores")
+        ax_ld.set_title(f"{axis} ({pe_pc[int(axis[-1]) - 1]*100:.1f}%)",
+                        fontsize=11, fontweight="bold")
+    fig_ld.suptitle(f"Taxa most associated with each axis ({pc_level}, top {pc_top} by |ρ|)",
+                    fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    with plot_area3:
+        st.pyplot(fig_ld)
+    plt.close(fig_ld)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Forward selection
@@ -679,3 +793,254 @@ comes from a permutation test (sample labels shuffled, RDA re-computed).
         with plot_area5:
             st.pyplot(fig_r)
         plt.close(fig_r)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. Co-occurrence network
+# ─────────────────────────────────────────────────────────────────────────────
+with tab6:
+    st.subheader("Co-occurrence network (taxa × time × treatment)")
+    st.markdown("""
+**Which bacteria move together — and does each of those groups follow time or treatment?**
+
+**Reading the figures**
+
+- **Circle** = one family (or genus); the bigger, the more abundant. **Line** = those two rise
+  and fall together: **green** = both go up, **red** = one up, the other down; thicker = stronger.
+- **Colour** = *module*, a block of families that behaves as one. The legend gives its trend with
+  time, ρ(day), and/or the treatment where it peaks (`*` p<0.05, `**` p<0.01, `***` p<0.001).
+- Families with no significant line are not drawn and belong to no module.
+- **Second figure:** how much of the community each module holds in every condition (%).
+
+**How it is built**
+
+1. One row per condition — 16S is sequenced on a *pooled* sample, so there are
+   **16 observations, not 48**.
+2. *Edges from* fixes what a line means (below).
+3. Abundances → % of the community; taxa above the **threshold** in at least one condition are kept.
+4. CLR transform, so that "one goes up, the rest go down" is not just the constant sum.
+5. Spearman on every pair; a line needs **FDR < 0.05 and |ρ| ≥ 0.6** (fixed in the code as
+   `NET_ALPHA` and `NET_MIN_RHO`).
+6. **Modules** blocks by greedy modularity maximisation on the network. The modularity **Q** in
+   the footer says how well that number of blocks fits — compare it as you move the slider.
+
+**Edges from** — it does not filter samples. It subtracts the mean of the *other* factor and
+correlates what is left over.
+
+| Mode | What is subtracted | Conditions | A line means |
+|------|--------------------|-----------|--------------|
+| **Both** | nothing | 16 | "these two co-vary somewhere in the experiment" — not why |
+| **Time** | each treatment's own mean | 14 | "these two follow the same trajectory through time" |
+| **Treatment** | each day's mean | 14 | "these two respond to the treatments in the same way" |
+
+*Time* drops CT and VCT, *Treatment* drops day 15: subtracting a mean needs ≥ 3 conditions per
+group, or it manufactures structure instead of removing it. It also costs one degree of freedom
+per group, so p-values use the residual df (n − g − 1). Each module is tested **only against the
+factor its edges came from** — a module with a strong ρ(day) but no treatment effect is
+*successional*; the reverse is a *treatment response*.
+""")
+    st.warning(
+        "**n = 16, not 48.** The 16S data comes from a **pooled** sample per treatment × day: "
+        "the three replicate rows are exact copies of each other. Correlating across the 48 rows "
+        "would be pseudoreplication and would shrink every p-value, so the network is built on "
+        "the 16 genuinely independent observations."
+    )
+    st.divider()
+    ctrl6, plot_area6 = st.columns([1, 4])
+    with ctrl6:
+        nw_level  = st.selectbox("Level", ["Family", "Genus"], key="nw_level")
+        nw_factor = st.selectbox("Edges from", ["Both", "Time", "Treatment"],
+                                 key="nw_factor")
+        nw_thr   = st.slider("Threshold", 0.005, 0.10, 0.02, 0.005,
+                             format="%.3f", key="nw_thr")
+        nw_k     = st.slider("Modules", 2, 8, 4, 1, key="nw_k")
+        nw_lbl   = st.checkbox("Node labels", value=True, key="nw_lbl")
+        st.caption(f"Fixed: FDR<{NET_ALPHA}, |ρ|≥{NET_MIN_RHO}, CLR on")
+
+    cols_n = levels[nw_level]
+    d_n    = df.dropna(subset=cols_n).copy()
+    # Pooled 16S: collapse the 3 identical replicate rows to the 16 real observations
+    key_n  = d_n["Tratamiento"].astype(str) + "_" + d_n["Dia"].astype(str)
+    td_n   = d_n.groupby(key_n)[cols_n].mean()
+    meta_n = d_n.groupby(key_n)[["Tratamiento", "Dia"]].first()
+
+    # `nw_factor` decides what an edge MEANS. 'Time' removes each treatment's own mean, so
+    # what is left is how a taxon moves through time; 'Treatment' removes each day's mean, so
+    # what is left is how it responds to the treatments. Conditions that cannot survive the
+    # centring are dropped first: a group of size 1 centres to exactly zero (CT and VCT, one
+    # day each), and a group of size 2 centres to two mirror-image rows whose correlation is
+    # forced to -1 for every taxon (day 15, only BA and BS). Hence the >= 3 rule.
+    grp_n = {"Time": meta_n["Tratamiento"].astype(str),
+             "Treatment": meta_n["Dia"].astype(str)}.get(nw_factor)
+    if grp_n is not None:
+        ok_n    = grp_n.groupby(grp_n.values).transform("size") >= 3
+        dropped_n = sorted(set(grp_n[~ok_n]))
+        td_n, meta_n, grp_n = td_n[ok_n.values], meta_n[ok_n.values], grp_n[ok_n.values]
+    else:
+        dropped_n = []
+
+    # Threshold applied AFTER the subset, so taxa are selected on the data actually used
+    rel_n  = td_n.div(td_n.sum(axis=1), axis=0)
+    R_n    = rel_n[rel_n.columns[rel_n.max(axis=0) >= nw_thr]]
+    R_n    = R_n.loc[:, R_n.std() > 0]          # a constant taxon has undefined correlation
+    taxa_n = list(R_n.columns)
+
+    n_obs_n = R_n.shape[0]
+    n_g_n   = grp_n.nunique() if grp_n is not None else 1
+    df_e_n  = n_obs_n - n_g_n - 1
+
+    if len(taxa_n) < 3:
+        with plot_area6:
+            st.info("Fewer than 3 taxa pass the threshold — lower it.")
+    elif df_e_n < 1:
+        with plot_area6:
+            st.info(f"Not enough residual degrees of freedom "
+                    f"(n={n_obs_n}, groups={n_g_n}).")
+    else:
+        # Centred log-ratio: relative abundances sum to 1, so an abundant taxon mechanically
+        # pushes every other one down. Without CLR only 8 of 124 edges came out negative here,
+        # which is the constant sum talking, not biology. Applied BEFORE the factor centring,
+        # since it is a per-sample transform.
+        M_n = np.log(R_n + 1e-6)
+        M_n = M_n.sub(M_n.mean(axis=1), axis=0)
+        if grp_n is not None:
+            M_n = M_n.sub(M_n.groupby(grp_n.values).transform("mean"))
+        rho_n, _ = spearmanr(M_n.values)
+        rho_n     = np.nan_to_num(rho_n)
+        # Centring spends one degree of freedom per group, so the p-values spearmanr derives
+        # from n-2 would be anticonservative. Recompute them from the t approximation on the
+        # residual df (g = 1 when nothing is centred out, which recovers the usual n-2).
+        tstat_n   = rho_n * np.sqrt(df_e_n / np.clip(1 - rho_n ** 2, 1e-12, None))
+        pmat_n    = 2 * tdist.sf(np.abs(tstat_n), df_e_n)
+        iu_n      = np.triu_indices(len(taxa_n), k=1)
+        pv_n      = np.nan_to_num(pmat_n[iu_n], nan=1.0)
+        rv_n      = rho_n[iu_n]
+        # Benjamini-Hochberg FDR across every taxon pair
+        o_n       = np.argsort(pv_n)
+        q_n       = np.empty_like(pv_n)
+        q_n[o_n]  = np.minimum.accumulate(
+            (pv_n[o_n] * pv_n.size / np.arange(1, pv_n.size + 1))[::-1])[::-1]
+        keep_n    = (np.clip(q_n, 0, 1) < NET_ALPHA) & (np.abs(rv_n) >= NET_MIN_RHO)
+        if not keep_n.any():
+            with plot_area6:
+                st.info("No pair survives FDR and |ρ| — lower the threshold to bring in "
+                        "more taxa.")
+            st.stop()   # section 6 is the last one rendered, so nothing else is lost
+
+        G_n = nx.Graph()
+        G_n.add_nodes_from(range(len(taxa_n)))
+        G_n.add_edges_from((int(a), int(b), {"w": abs(float(r)), "r": float(r)})
+                           for a, b, r in zip(iu_n[0][keep_n], iu_n[1][keep_n], rv_n[keep_n]))
+        # Taxa without a single significant edge are not part of any block of the network:
+        # dropped from the drawing (the layout flings them to the margins) and from the modules
+        shown_n = [i for i in G_n.nodes if G_n.degree(i) > 0]
+        G_n     = G_n.subgraph(shown_n).copy()
+
+        # Modules = blocks of the network itself, by greedy modularity maximisation
+        # (Clauset-Newman-Moore) split into exactly nw_k blocks (cutoff=best_n=k). This replaced
+        # cutting the taxa dendrogram, which optimises nothing about the network: at the same k
+        # it gives a clearly worse partition (Q=0.22 vs 0.35 here, family level, Both).
+        # Communities come back largest-first, so M1 is always the biggest block.
+        comms_n = nx.community.greedy_modularity_communities(G_n, weight="w",
+                                                             cutoff=nw_k, best_n=nw_k)
+        Q_n     = nx.community.modularity(G_n, comms_n, weight="w")
+        mod_n   = {i: m for m, c in enumerate(comms_n, start=1) for i in c}
+
+        # Per-module response, reported only for the factor the edges were built from:
+        # showing a treatment test on a network whose treatment effect was centred out would
+        # invite a reading the figure does not support. Always computed on UNCENTRED
+        # abundances, so the numbers stay in interpretable units.
+        show_time_n = nw_factor in ("Both", "Time")
+        show_trt_n  = nw_factor in ("Both", "Treatment")
+        mstats_n = {}
+        for m in sorted(set(mod_n.values())):
+            members = [taxa_n[i] for i in shown_n if mod_n[i] == m]
+            score   = R_n[members].sum(axis=1)  # share of the community held by the module
+            r_t = p_t = p_tr = np.nan
+            if show_time_n:
+                r_t, p_t = spearmanr(score.values, meta_n["Dia"].values)
+            if show_trt_n:
+                try:
+                    p_tr = kruskal(*[score.values[meta_n["Tratamiento"].values == t]
+                                     for t in meta_n["Tratamiento"].unique()])[1]
+                except ValueError:              # identical values inside some treatment
+                    p_tr = np.nan
+            mstats_n[m] = dict(n=len(members), score=score, rho=r_t, p_time=p_t, p_trt=p_tr,
+                               top=score.groupby(meta_n["Tratamiento"].values).mean().idxmax())
+
+        def _mlabel_n(m):
+            s, bits = mstats_n[m], [f"M{m} (n={mstats_n[m]['n']})"]
+            if show_time_n:
+                bits.append(f"ρ(day)={s['rho']:+.2f}{_star(s['p_time'])}")
+            if show_trt_n:
+                bits.append(f"top:{s['top']}{_star(s['p_trt'])}")
+            return "   ".join(bits)
+
+        pos_n   = nx.spring_layout(G_n, seed=42, weight="w",
+                                   k=3.4 / np.sqrt(max(len(shown_n), 1)), iterations=400)
+        xy_n    = np.array([pos_n[i] for i in shown_n]) if shown_n else np.empty((0, 2))
+        mods_n  = np.array([mod_n[i] for i in shown_n])
+        cmap_n  = _palette(mods_n)
+        dark_n  = {m: tuple(np.r_[np.array(c[:3]) * 0.55, 1.0]) for m, c in cmap_n.items()}
+        amean_n = R_n.mean()
+        size_n  = 90 + 1400 * (amean_n / amean_n.max()).values[shown_n]
+
+        fig_n, ax_n = plt.subplots(figsize=(11, 9))
+        for sign, colr in ((1, "#2e8b57"), (-1, "#c0392b")):  # green = co-occur, red = exclude
+            sel = [(a, b) for a, b, e in G_n.edges(data=True) if np.sign(e["r"]) == sign]
+            if sel:
+                nx.draw_networkx_edges(G_n, pos_n, edgelist=sel, ax=ax_n, edge_color=colr,
+                                       alpha=0.35, width=[G_n[a][b]["w"] * 1.8 for a, b in sel])
+        if shown_n:
+            ax_n.scatter(xy_n[:, 0], xy_n[:, 1], s=size_n, c=[cmap_n[m] for m in mods_n],
+                         edgecolor="white", linewidth=0.8, zorder=3)
+        for m in sorted(mstats_n):
+            ax_n.scatter([], [], s=60, color=cmap_n[m], edgecolor="white", linewidth=0.8,
+                         label=_mlabel_n(m))
+        if nw_lbl and shown_n:
+            _place_labels(ax_n, xy_n, np.array(taxa_n)[shown_n], mods_n, dark_n)
+        edge_of_n = {"Both": "time + treatment", "Time": "time only",
+                     "Treatment": "treatment only"}[nw_factor]
+        ax_n.set_title(
+            f"Co-occurrence network ({nw_level}, {len(shown_n)} of {len(taxa_n)} taxa connected)"
+            f"\nedges from: {edge_of_n}",
+            fontsize=13, fontweight="bold",
+        )
+        ax_n.legend(bbox_to_anchor=(1.01, 1), loc="upper left", fontsize="small")
+        ax_n.axis("off")
+        npos_n  = int((rv_n[keep_n] > 0).sum())
+        nneg_n  = int(keep_n.sum()) - npos_n
+        plt.tight_layout()
+        # Footer anchored to the figure: the legend shifts the axes and an axes-relative
+        # footer gets clipped off the left edge.
+        fig_n.text(0.5, 0.015,
+                   f"n={n_obs_n} pooled conditions, df={df_e_n}"
+                   f"{'   (excluded: ' + ', '.join(dropped_n) + ')' if dropped_n else ''}   |   "
+                   f"{int(keep_n.sum())} edges ({npos_n} positive, {nneg_n} negative) "
+                   f"of {pv_n.size} pairs   |   "
+                   f"FDR<{NET_ALPHA}, |ρ|≥{NET_MIN_RHO}, CLR   |   "
+                   f"{len(mstats_n)} modules (Q={Q_n:.3f})",
+                   ha="center", fontsize=8.5,
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5",
+                             edgecolor="#aaa", alpha=0.8))
+        with plot_area6:
+            st.pyplot(fig_n)
+        plt.close(fig_n)
+
+        # Module × condition panel: the half that literally answers "time and treatment"
+        # Only the conditions that actually entered the calculation, in the canonical ORDER
+        cond_n  = [c for c in ORDER if c in R_n.index]
+        panel_n = pd.DataFrame({m: mstats_n[m]["score"] for m in sorted(mstats_n)}).T
+        panel_n = panel_n.reindex(columns=cond_n)
+        fig_p, ax_p = plt.subplots(figsize=(13, 0.9 * len(mstats_n) + 2.2))
+        sns.heatmap(panel_n * 100, ax=ax_p, cmap="YlGnBu", annot=True, fmt=".1f",
+                    annot_kws={"size": 7}, linewidths=0.4, linecolor="white",
+                    cbar_kws={"label": "Module share of community (%)"})
+        ax_p.set_yticklabels([_mlabel_n(m) for m in sorted(mstats_n)], rotation=0)
+        ax_p.set(xlabel="Treatment + Day", ylabel="")
+        ax_p.set_title(f"Module abundance across treatment and time "
+                       f"({nw_level}, edges from {edge_of_n})",
+                       fontsize=12, fontweight="bold")
+        plt.tight_layout()
+        with plot_area6:
+            st.pyplot(fig_p)
+        plt.close(fig_p)

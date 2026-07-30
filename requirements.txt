@@ -5,4 +5,5 @@ matplotlib
 seaborn
 scipy
 scikit-bio
+networkx
 adjustText
